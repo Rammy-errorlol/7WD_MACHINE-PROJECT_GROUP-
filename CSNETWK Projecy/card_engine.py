@@ -35,6 +35,23 @@ class CardDatabaseEngine:
         df.columns = [str(col).strip() for col in df.iloc[0]]
         return df.iloc[1:].reset_index(drop=True)
 
+    def lookup_card(self, card_id: str):
+        """Return the full card dict for ANY card_id (Age I/II/III sheets or Guilds), or None."""
+        for df in (self.age1_df, self.age2_df, self.age3_df, self.guilds_df):
+            sub = df[df["Card Name"].astype(str).str.strip() == card_id]
+            if len(sub) > 0:
+                row = sub.iloc[0]
+                return {
+                    "card_id": card_id,
+                    "name": card_id,
+                    "color": "PURPLE" if df is self.guilds_df else str(row["Color"]).strip().upper(),
+                    "cost": str(row.get("Cost to Build", "Free")).strip(),
+                    "effect": str(row.get("Effect", "")).strip(),
+                    "chain_from": str(row.get("Free-Build After (Chain From)", "—")).strip(),
+                    "chain_to": str(row.get("Enables Free Build Of (Chain To)", "—")).strip(),
+                }
+        return None
+
     def derive_ring_seating(self, seed: bytes, live_peer_ids: List[int]) -> List[int]:
         scored = []
         for pid in live_peer_ids:

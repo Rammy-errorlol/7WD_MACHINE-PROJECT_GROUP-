@@ -79,9 +79,15 @@ T_LOBBY_TIMEOUT = 120.0
 MIN_PLAYERS = 3
 MAX_PLAYERS = 7
 
+def clip_text(text: str, limit: int = 1000) -> str:
+    """RFC 8.3: chat text must be <= 1000 bytes of UTF-8."""
+    return text.encode("utf-8")[:limit].decode("utf-8", "ignore")
+
+
 class Peer7WDNode:
     def __init__(self, display_name: str, room_code: str, host: str, game_port: int,
-                 lobby_port: int = 7777, verbose: bool = False, spectator: bool = False):
+                 lobby_port: int = 7777, verbose: bool = False, spectator: bool = False,
+                 card_db: str = "Card Database 7WD.xlsx"):
         self.display_name = display_name
         self.room_code = room_code
         self.host = host
@@ -110,6 +116,7 @@ class Peer7WDNode:
         self.unacked_packets: Dict[Tuple[int, int], dict] = {}
         self.channel_rto: Dict[int, float] = {}
         self.channel_rtt: Dict[int, float] = {}
+        self.channel_rto_base: Dict[int, float] = {}
         self.delivered_seqs: Dict[int, Set[int]] = {}
 
         self.my_nonce = os.urandom(32)
@@ -122,7 +129,7 @@ class Peer7WDNode:
         self.my_wonder_board: Dict[str, Any] = {}
         self.all_wonders: Dict[int, Dict[str, Any]] = {}
 
-        self.card_engine = CardDatabaseEngine()
+        self.card_engine = CardDatabaseEngine(card_db)
         self.current_age = 1
         self.current_turn = 1
         self.current_hand: List[Dict[str, Any]] = []
@@ -298,6 +305,7 @@ class Peer7WDNode:
                 "spectator": self.spectator
             }
             raw = self.pack_packet(MSG_LOBBY_PRESENCE, payload, seq=0, ack=0)
+            self.log("SENT", ("<broadcast>", self.lobby_port), MSG_LOBBY_PRESENCE, 0, 0, 0, payload)
 
             try:
                 self.lobby_sock.sendto(raw, ("<broadcast>", self.lobby_port))
@@ -337,6 +345,7 @@ class Peer7WDNode:
 
         payload = {"participants": sorted_participants}
         raw = self.pack_packet(MSG_LOBBY_START_VOTE, payload)
+        self.log("SENT", ("<broadcast>", self.lobby_port), MSG_LOBBY_START_VOTE, 0, 0, 0, payload)
 
         targets = [("<broadcast>", self.lobby_port), ("127.0.0.1", self.lobby_port)]
         for info in self.lobby_roster.values():
@@ -406,6 +415,7 @@ class Peer7WDNode:
                     "participants_hash": p_hash
                 }
                 ack_pkt = self.pack_packet(MSG_LOBBY_START_ACK, ack_payload)
+                self.log("SENT", ("<broadcast>", self.lobby_port), MSG_LOBBY_START_ACK, 0, 0, 0, ack_payload)
 
                 targets = [("<broadcast>", self.lobby_port), ("127.0.0.1", self.lobby_port)]
                 for info in self.lobby_roster.values():
@@ -448,6 +458,8 @@ class Peer7WDNode:
                 opcode, flags, sender_pid, sess_id, plen, seq, ack, payload = self.unpack_packet(data)
                 if sess_id != self.session_id:
                     continue
+                if not (opcode == MSG_LOBBY_PRESENCE and payload.get("lobby_peer_id") == self.lobby_peer_id):
+                    self.log("RECV", addr, opcode, seq, ack, flags, payload)
                 self._handle_lobby_packet(opcode, payload, addr)
             except Exception:
                 pass
@@ -726,16 +738,20 @@ class Peer7WDNode:
         self.revealed_this_turn = False
         self.announced_this_turn = False
 
-        if self.current_turn == 6:
-            print(f"\n[*] Turn 6 finished. 7th card silently discarded.")
-            self.current_hand.clear()
-            self._resolve_military_age_end()
-            return
-
         k = len(self.seating_order)
         direction = -1 if self.current_age in (1, 3) else 1
         neighbor_seat = (self.my_seat + direction) % k
         target_pid = self.seating_order[neighbor_seat]
+
+        if self.current_turn == 6:
+            print(f"\n[*] Turn 6 finished. Unplayed card silently set aside.")
+            self.current_hand.clear()
+            # RFC 7.8: the Turn 6 HAND_PASS is still sent, but with an EMPTY cards array
+            self.send_reliable(target_pid, MSG_HAND_PASS, {
+                "age": self.current_age, "turn": 6, "cards": []
+            })
+            self._resolve_military_age_end()
+            return
 
         pass_payload = {
             "age": self.current_age,
@@ -746,27 +762,17 @@ class Peer7WDNode:
 
     def _handle_hand_pass(self, sender_pid: int, payload: dict):
         if self.spectator: return
+        if payload.get("turn") == 6:
+            return  # Turn 6 pass carries an empty hand: nothing to deal, and the Age is ending
         cids = payload.get("cards", [])
         new_hand = []
         for cid in cids:
-            found = False
-            for df in (self.card_engine.age1_df, self.card_engine.age2_df, self.card_engine.age3_df):
-                sub = df[df["Card Name"] == cid]
-                if len(sub) > 0:
-                    row = sub.iloc[0]
-                    new_hand.append({
-                        "card_id": cid,
-                        "name": cid,
-                        "color": str(row["Color"]).strip().upper(),
-                        "cost": str(row.get("Cost to Build", "Free")).strip(),
-                        "effect": str(row.get("Effect", "")).strip(),
-                        "chain_from": str(row.get("Free-Build After (Chain From)", "—")).strip(),
-                        "instance_id": f"{cid}_{os.urandom(4).hex()}"
-                    })
-                    found = True
-                    break
-            if not found:
-                new_hand.append({"card_id": cid, "name": cid, "color": "PURPLE", "cost": "Free", "instance_id": cid})
+            card = self.card_engine.lookup_card(cid)   # works for Age I/II/III cards AND guilds
+            if card is None:
+                print(f"[!] HAND_PASS contained unknown card_id '{cid}'")
+                continue
+            card["instance_id"] = f"{cid}_{os.urandom(4).hex()}"
+            new_hand.append(card)
 
         self.current_hand = new_hand
         self.current_turn += 1
@@ -891,6 +897,8 @@ class Peer7WDNode:
                     with self.state_lock:
                         if (sender_pid, ack) in self.unacked_packets:
                             del self.unacked_packets[(sender_pid, ack)]
+                            # RFC 6.3: a successful ACK resets the RTO (to the RTT-seeded base if we have one)
+                            self.channel_rto[sender_pid] = self.channel_rto_base.get(sender_pid, RTO_INIT)
 
                 if opcode not in UNRELIABLE_MESSAGES and seq > 0 and not self.spectator:
                     with self.state_lock:
@@ -923,7 +931,8 @@ class Peer7WDNode:
                 elif opcode == MSG_PONG:
                     rtt = (time.time() * 1000) - payload.get("echo_sent_at_ms", time.time() * 1000)
                     self.channel_rtt[sender_pid] = rtt / 1000.0
-                    self.channel_rto[sender_pid] = max(0.200, min(RTO_MAX, (rtt / 1000.0) * 2.5))
+                    self.channel_rto_base[sender_pid] = max(0.200, min(RTO_MAX, (rtt / 1000.0) * 2.5))
+                    self.channel_rto[sender_pid] = self.channel_rto_base[sender_pid]
                 elif opcode == MSG_SEED_COMMIT:
                     self._handle_seed_commit(sender_pid, payload)
                 elif opcode == MSG_SEED_REVEAL:
@@ -952,8 +961,10 @@ class Peer7WDNode:
                 elif opcode == MSG_ERROR:
                     print(f"\n[!] ERROR BROADCAST: {payload.get('code')} -> {payload.get('detail')}")
 
-            except Exception:
-                pass
+            except ConnectionResetError:
+                continue  # Windows: ICMP "port unreachable" from a peer that isn't running yet
+            except Exception as e:
+                print(f"[!] _game_listener error: {type(e).__name__}: {e}")
 
 
 def main():
@@ -961,6 +972,8 @@ def main():
     parser.add_argument("--name", required=True, help="Player or spectator name")
     parser.add_argument("--room", default="cs-demo", help="Room code for Lobby hash derivation")
     parser.add_argument("--port", type=int, required=True, help="Game UDP port")
+    parser.add_argument("--host", default="127.0.0.1", help="IP to bind AND advertise to peers (use your LAN IP for multi-PC play)")
+    parser.add_argument("--cards", default="Card Database 7WD.xlsx", help="Path to the card database spreadsheet")
     parser.add_argument("--lobby_port", type=int, default=7777, help="Lobby discovery port")
     parser.add_argument("--verbose", action="store_true", default=False, help="Enable verbose network logging")
     parser.add_argument("--spectator", action="store_true", help="Launch in Creative Extension Spectator Role (Bonus 10 pts)")
@@ -969,11 +982,12 @@ def main():
     node = Peer7WDNode(
         display_name=args.name,
         room_code=args.room,
-        host="127.0.0.1",
+        host=args.host,
         game_port=args.port,
         lobby_port=args.lobby_port,
         verbose=args.verbose,
-        spectator=args.spectator
+        spectator=args.spectator,
+        card_db=args.cards
     )
 
     role_desc = "SPECTATOR MODE (Bonus Extension)" if args.spectator else "PLAYER NODE"
@@ -1009,9 +1023,9 @@ def main():
                 action = parts[2].upper() if len(parts) > 2 else "BUILD"
                 node.draft_action(int(parts[1]), action)
             elif cmd == "dm" and len(parts) > 2:
-                node.send_reliable(int(parts[1]), MSG_DIRECT_MESSAGE, {"text": parts[2]})
+                node.send_reliable(int(parts[1]), MSG_DIRECT_MESSAGE, {"text": clip_text(parts[2])})
             elif cmd == "msg" and len(parts) > 1:
-                node.broadcast_mesh(MSG_GROUP_MESSAGE, {"text": line.split(" ", 1)[1]}, reliable=False)
+                node.broadcast_mesh(MSG_GROUP_MESSAGE, {"text": clip_text(line.split(" ", 1)[1])})
             elif cmd == "ping" and len(parts) > 1:
                 target_pid = int(parts[1])
                 if target_pid in node.manifest:
