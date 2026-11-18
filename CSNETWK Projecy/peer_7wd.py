@@ -109,6 +109,7 @@ class Peer7WDNode:
 
         self.manifest: Dict[int, Tuple[str, int]] = {}
         self.manifest_names: Dict[int, str] = {}
+        self.hello_acks_received: Set[int] = set()
         self.spectator_addrs: Set[Tuple[str, int]] = set()
 
         self.channel_seq: Dict[int, int] = {}
@@ -128,6 +129,7 @@ class Peer7WDNode:
         self.my_seat = 0
         self.my_wonder_board: Dict[str, Any] = {}
         self.all_wonders: Dict[int, Dict[str, Any]] = {}
+        self.selected_guilds: List[str] = []
 
         self.card_engine = CardDatabaseEngine(card_db)
         self.current_age = 1
@@ -258,6 +260,24 @@ class Peer7WDNode:
 
         for s_addr in list(self.spectator_addrs):
             self.send_unreliable(s_addr, opcode, payload)
+
+    def broadcast_error(self, code: str, detail: str):
+        self.broadcast_mesh(MSG_ERROR, {"code": code, "detail": detail})
+
+    def leave_lobby(self):
+        if self.lobby_closed:
+            return
+        payload = {"lobby_peer_id": self.lobby_peer_id}
+        raw = self.pack_packet(MSG_LOBBY_LEAVE, payload, seq=0, ack=0)
+        self.log("SENT", ("<broadcast>", self.lobby_port), MSG_LOBBY_LEAVE, 0, 0, 0, payload)
+        targets = [("<broadcast>", self.lobby_port), ("127.0.0.1", self.lobby_port)]
+        for info in list(self.lobby_roster.values()):
+            targets.append((info["host"], info["port"]))
+        for dest in targets:
+            try:
+                self.lobby_sock.sendto(raw, dest)
+            except Exception:
+                pass
 
     def _retransmission_daemon(self):
         while self.running:
@@ -398,6 +418,13 @@ class Peer7WDNode:
         if opcode == MSG_LOBBY_PRESENCE:
             self._handle_presence_packet(payload, addr)
 
+        elif opcode == MSG_LOBBY_LEAVE and not self.lobby_closed:
+            lpid = payload.get("lobby_peer_id")
+            with self.state_lock:
+                if lpid and lpid in self.lobby_roster:
+                    del self.lobby_roster[lpid]
+                    self.last_roster_change = time.time()
+
         elif opcode == MSG_LOBBY_START_VOTE and not self.lobby_closed:
             proposed = payload.get("participants", [])
             if self.spectator:
@@ -474,6 +501,7 @@ class Peer7WDNode:
                 self.manifest_peer_id = rank
                 self.manifest[rank] = (self.host, self.game_port)
                 self.manifest_names[rank] = self.display_name
+                self.hello_acks_received.add(rank)
             else:
                 pinfo = self.lobby_roster.get(lpid)
                 if pinfo:
@@ -522,6 +550,10 @@ class Peer7WDNode:
 
     def _handle_seed_reveal(self, sender_pid: int, payload: dict):
         nonce_bytes = bytes.fromhex(payload["nonce"])
+        expected_commit = self.collected_commits.get(sender_pid)
+        if not expected_commit or sha256_hex(nonce_bytes) != expected_commit:
+            self.broadcast_error("COMMITMENT_MISMATCH", f"SEED_REVEAL mismatch from peer {sender_pid}")
+            return
         self.collected_reveals[sender_pid] = nonce_bytes
         self._check_seed_reveal_barrier()
 
@@ -534,6 +566,9 @@ class Peer7WDNode:
             live_pids = sorted(list(self.manifest.keys()))
             self.seating_order = self.card_engine.derive_ring_seating(self.shared_seed, live_pids)
             self.all_wonders = self.card_engine.assign_wonders(self.shared_seed, self.seating_order)
+            self.selected_guilds = [
+                g["card_id"] for g in self.card_engine.select_guild_cards(self.shared_seed, len(self.seating_order))
+            ]
 
             for pid in self.seating_order:
                 self.public_tableaus[pid] = {
@@ -551,8 +586,10 @@ class Peer7WDNode:
                 self.resources[self.my_wonder_board["starting_resource"]] += 1
                 self.broadcast_mesh(MSG_RING_CONFIRM, {
                     "seat": self.my_seat,
+                    "seating_order": self.seating_order,
                     "wonder_board": self.my_wonder_board["board"],
-                    "wonder_side": self.my_wonder_board["side"]
+                    "wonder_side": self.my_wonder_board["side"],
+                    "guilds": self.selected_guilds
                 })
                 self._deal_age(1)
             else:
@@ -562,6 +599,18 @@ class Peer7WDNode:
                     wb = self.all_wonders[pid]
                     print(f"  Seat {s_idx}: {pname:<10} | Wonder: {wb['board']} (Side {wb['side']}) | Starts with {wb['starting_resource']}")
                 print("\n[SPECTATOR] Age 1 has begun! Live monitoring card drafts...\n")
+
+    def _handle_ring_confirm(self, sender_pid: int, payload: dict):
+        if self.shared_seed is None:
+            return
+        expected_seat = self.seating_order.index(sender_pid) if sender_pid in self.seating_order else -1
+        expected_wb = self.all_wonders.get(sender_pid, {})
+        if (payload.get("seat") != expected_seat or
+                payload.get("wonder_board") != expected_wb.get("board") or
+                payload.get("wonder_side") != expected_wb.get("side") or
+                payload.get("seating_order", self.seating_order) != self.seating_order or
+                payload.get("guilds", self.selected_guilds) != self.selected_guilds):
+            self.broadcast_error("RING_MISMATCH", f"RING_CONFIRM mismatch from peer {sender_pid}")
 
     def _deal_age(self, age: int):
         self.current_age = age
@@ -746,7 +795,6 @@ class Peer7WDNode:
         if self.current_turn == 6:
             print(f"\n[*] Turn 6 finished. Unplayed card silently set aside.")
             self.current_hand.clear()
-            # RFC 7.8: the Turn 6 HAND_PASS is still sent, but with an EMPTY cards array
             self.send_reliable(target_pid, MSG_HAND_PASS, {
                 "age": self.current_age, "turn": 6, "cards": []
             })
@@ -763,11 +811,11 @@ class Peer7WDNode:
     def _handle_hand_pass(self, sender_pid: int, payload: dict):
         if self.spectator: return
         if payload.get("turn") == 6:
-            return  # Turn 6 pass carries an empty hand: nothing to deal, and the Age is ending
+            return
         cids = payload.get("cards", [])
         new_hand = []
         for cid in cids:
-            card = self.card_engine.lookup_card(cid)   # works for Age I/II/III cards AND guilds
+            card = self.card_engine.lookup_card(cid)
             if card is None:
                 print(f"[!] HAND_PASS contained unknown card_id '{cid}'")
                 continue
@@ -897,7 +945,6 @@ class Peer7WDNode:
                     with self.state_lock:
                         if (sender_pid, ack) in self.unacked_packets:
                             del self.unacked_packets[(sender_pid, ack)]
-                            # RFC 6.3: a successful ACK resets the RTO (to the RTT-seeded base if we have one)
                             self.channel_rto[sender_pid] = self.channel_rto_base.get(sender_pid, RTO_INIT)
 
                 if opcode not in UNRELIABLE_MESSAGES and seq > 0 and not self.spectator:
@@ -911,8 +958,7 @@ class Peer7WDNode:
                         self.delivered_seqs[sender_pid].add(seq)
                     self.send_bare_ack(sender_pid, seq)
 
-                # Route all lobby opcodes arrived on game_sock
-                if opcode in (MSG_LOBBY_PRESENCE, MSG_LOBBY_START_VOTE, MSG_LOBBY_START_ACK):
+                if opcode in (MSG_LOBBY_PRESENCE, MSG_LOBBY_LEAVE, MSG_LOBBY_START_VOTE, MSG_LOBBY_START_ACK):
                     self._handle_lobby_packet(opcode, payload, addr)
                 elif opcode == MSG_SPECTATOR_SYNC and self.spectator:
                     self.seating_order = payload.get("seating_order", [])
@@ -926,6 +972,10 @@ class Peer7WDNode:
                     self.print_spectator_dashboard()
                 elif opcode == MSG_HELLO and not self.spectator:
                     self.send_reliable(sender_pid, MSG_HELLO_ACK, {})
+                elif opcode == MSG_HELLO_ACK and not self.spectator:
+                    self.hello_acks_received.add(sender_pid)
+                    if sender_pid in self.manifest:
+                        self.send_unreliable(self.manifest[sender_pid], MSG_PING, {"sent_at_ms": int(time.time() * 1000)})
                 elif opcode == MSG_PING and not self.spectator:
                     self.send_unreliable(addr, MSG_PONG, {"echo_sent_at_ms": payload.get("sent_at_ms", 0)})
                 elif opcode == MSG_PONG:
@@ -938,8 +988,7 @@ class Peer7WDNode:
                 elif opcode == MSG_SEED_REVEAL:
                     self._handle_seed_reveal(sender_pid, payload)
                 elif opcode == MSG_RING_CONFIRM:
-                    if sender_pid not in self.seating_order:
-                        self.seating_order.append(sender_pid)
+                    self._handle_ring_confirm(sender_pid, payload)
                 elif opcode == MSG_CARD_COMMIT:
                     self._handle_card_commit(sender_pid, payload)
                 elif opcode == MSG_CARD_REVEAL:
@@ -962,7 +1011,7 @@ class Peer7WDNode:
                     print(f"\n[!] ERROR BROADCAST: {payload.get('code')} -> {payload.get('detail')}")
 
             except ConnectionResetError:
-                continue  # Windows: ICMP "port unreachable" from a peer that isn't running yet
+                continue
             except Exception as e:
                 print(f"[!] _game_listener error: {type(e).__name__}: {e}")
 
@@ -1037,9 +1086,11 @@ def main():
                 print(f"Manifest: {node.manifest_names}")
                 print(f"Seating Ring: {node.seating_order} (My Seat: {node.my_seat})")
             elif cmd == "quit":
+                node.leave_lobby()
                 node.running = False
                 break
         except KeyboardInterrupt:
+            node.leave_lobby()
             node.running = False
             break
 
