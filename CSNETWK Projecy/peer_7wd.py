@@ -152,6 +152,7 @@ class Peer7WDNode:
         self.action_announcements: Dict[int, dict] = {}
         self.age_end_shields: Dict[int, int] = {}
         self.collected_score_reports: Dict[int, dict] = {}
+        self.game_end_broadcasted = False
 
         self.chosen_card: Optional[Dict[str, Any]] = None
         self.chosen_action: str = "BUILD"
@@ -675,16 +676,24 @@ class Peer7WDNode:
                     "age": self.current_age,
                     "turn": self.current_turn,
                     "action": self.chosen_action,
+                    "card_id": self.chosen_card["card_id"],
                     "nonce": self.chosen_nonce.hex()
                 }
-                if self.chosen_action == "BUILD":
-                    reveal_payload["card_id"] = self.chosen_card["card_id"]
 
                 self.broadcast_mesh(MSG_CARD_REVEAL, reveal_payload)
                 self.card_reveals[self.manifest_peer_id] = reveal_payload
                 self._check_card_reveal_barrier()
 
     def _handle_card_reveal(self, sender_pid: int, payload: dict):
+        expected_commit = self.card_commits.get(sender_pid)
+        cid = payload.get("card_id", "")
+        act = payload.get("action", "")
+        nonce_bytes = bytes.fromhex(payload.get("nonce", ""))
+        if expected_commit and cid:
+            token = cid.encode("utf-8") + act.encode("utf-8") + nonce_bytes
+            if sha256_hex(token) != expected_commit:
+                self.broadcast_error("COMMITMENT_MISMATCH", f"CARD_REVEAL mismatch from peer {sender_pid}")
+                return
         self.card_reveals[sender_pid] = payload
         self._check_card_reveal_barrier()
 
@@ -758,10 +767,22 @@ class Peer7WDNode:
         sender_name = payload.get("peer_name", self.manifest_names.get(sender_pid, f"Player {sender_pid}"))
         self.manifest_names[sender_pid] = sender_name
 
-        tab = self.public_tableaus.setdefault(sender_pid, {"built_cards": [], "coins": 3, "wonder_stages_built": 0})
+        tab = self.public_tableaus.setdefault(sender_pid, {
+            "built_cards": [], "coins": 3, "wonder_stages_built": 0,
+            "military_tokens": [], "science_symbols": []
+        })
         if act == "BUILD":
             cid = payload.get("card_id")
-            tab["built_cards"].append({"card_id": cid, "color": "UNKNOWN"})
+            card_obj = self.card_engine.lookup_card(cid) or {"card_id": cid, "color": "UNKNOWN", "effect": ""}
+            cost_paid = payload.get("cost_paid", {})
+            tab["coins"] = tab.get("coins", 3) - int(cost_paid.get("coins", 0))
+            if card_obj.get("color") == "YELLOW" and "3 coins" in card_obj.get("effect", ""):
+                tab["coins"] += 3
+            elif card_obj.get("color") == "GREEN":
+                eff = card_obj.get("effect", "")
+                sym = "TABLET" if "Tablet" in eff else "COMPASS" if "Compass" in eff else "GEAR"
+                tab.setdefault("science_symbols", []).append(sym)
+            tab["built_cards"].append(card_obj)
             if self.spectator:
                 print(f"[TURN {payload.get('turn')}] {sender_name} BUILT: '{cid}'")
         elif act == "WONDER_STAGE":
@@ -847,24 +868,22 @@ class Peer7WDNode:
 
         if not self.spectator and len(self.age_end_shields) == len(self.seating_order):
             k = len(self.seating_order)
-            left_pid = self.seating_order[(self.my_seat - 1) % k]
-            right_pid = self.seating_order[(self.my_seat + 1) % k]
-
             win_vp = 1 if self.current_age == 1 else 3 if self.current_age == 2 else 5
-            if self.military_shields > self.age_end_shields[left_pid]:
-                self.military_tokens.append(win_vp)
-                print(f"[MILITARY] Victory vs Left Neighbor (Peer {left_pid})! (+{win_vp} VP)")
-            elif self.military_shields < self.age_end_shields[left_pid]:
-                self.military_tokens.append(-1)
-                print(f"[MILITARY] Defeat vs Left Neighbor (Peer {left_pid})! (-1 VP)")
 
-            if self.military_shields > self.age_end_shields[right_pid]:
-                self.military_tokens.append(win_vp)
-                print(f"[MILITARY] Victory vs Right Neighbor (Peer {right_pid})! (+{win_vp} VP)")
-            elif self.military_shields < self.age_end_shields[right_pid]:
-                self.military_tokens.append(-1)
-                print(f"[MILITARY] Defeat vs Right Neighbor (Peer {right_pid})! (-1 VP)")
+            for seat_idx, pid in enumerate(self.seating_order):
+                l_pid = self.seating_order[(seat_idx - 1) % k]
+                r_pid = self.seating_order[(seat_idx + 1) % k]
+                toks = self.public_tableaus[pid].setdefault("military_tokens", [])
+                if self.age_end_shields[pid] > self.age_end_shields[l_pid]:
+                    toks.append(win_vp)
+                elif self.age_end_shields[pid] < self.age_end_shields[l_pid]:
+                    toks.append(-1)
+                if self.age_end_shields[pid] > self.age_end_shields[r_pid]:
+                    toks.append(win_vp)
+                elif self.age_end_shields[pid] < self.age_end_shields[r_pid]:
+                    toks.append(-1)
 
+            self.military_tokens = list(self.public_tableaus[self.manifest_peer_id]["military_tokens"])
             self.age_end_shields.clear()
             if self.current_age < 3:
                 self._deal_age(self.current_age + 1)
@@ -889,7 +908,15 @@ class Peer7WDNode:
 
     def _handle_score_report(self, sender_pid: int, payload: dict):
         self.collected_score_reports[sender_pid] = payload
-        if len(self.collected_score_reports) == len(self.seating_order):
+        if len(self.collected_score_reports) == len(self.seating_order) and not self.game_end_broadcasted:
+            if not self.spectator:
+                expected_all = compute_all_scores(self.seating_order, self.public_tableaus)
+                for pid, reported in self.collected_score_reports.items():
+                    if reported.get("total") != expected_all.get(pid, {}).get("total"):
+                        self.broadcast_error("SCORE_MISMATCH", f"SCORE_REPORT mismatch from peer {pid}")
+                        return
+
+            self.game_end_broadcasted = True
             print("\n======================= FINAL SCOREBOARD =======================")
             ranked = []
             for pid, sc in self.collected_score_reports.items():
