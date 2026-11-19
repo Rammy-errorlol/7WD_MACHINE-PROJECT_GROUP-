@@ -154,6 +154,10 @@ class Peer7WDNode:
         self.collected_score_reports: Dict[int, dict] = {}
         self.game_end_broadcasted = False
 
+        self.resources_bought_this_turn: List[Dict[str, Any]] = []
+        self.pending_offers: Dict[int, Dict[str, int]] = {}
+        self.offer_event = threading.Event()
+
         self.chosen_card: Optional[Dict[str, Any]] = None
         self.chosen_action: str = "BUILD"
         self.chosen_nonce: bytes = b""
@@ -618,6 +622,7 @@ class Peer7WDNode:
         self.current_turn = 1
         self.revealed_this_turn = False
         self.announced_this_turn = False
+        self.resources_bought_this_turn.clear()
         full_deck = self.card_engine.build_age_deck(self.shared_seed, age, len(self.seating_order))
         self.current_hand = full_deck[self.my_seat * 7 : (self.my_seat + 1) * 7]
         print(f"\n=======================================================")
@@ -633,6 +638,65 @@ class Peer7WDNode:
         for idx, card in enumerate(self.current_hand):
             print(f"  {idx}: {card['name']:<20} | Color: {card['color']:<6} | Cost: {card['cost']:<14} | Chain: {card['chain_from']}")
         print("To act: type 'pick <index> [BUILD / DISCARD / WONDER]'")
+
+    def trade_resource(self, direction: str, resource: str):
+        if self.spectator or not self.seating_order:
+            return
+        k = len(self.seating_order)
+        offset = -1 if direction.lower() == "left" else 1
+        target_pid = self.seating_order[(self.my_seat + offset) % k]
+        res_key = resource.upper()
+        self.send_reliable(target_pid, MSG_RESOURCE_QUERY, {
+            "age": self.current_age,
+            "turn": self.current_turn,
+            "resource": res_key,
+            "quantity": 1
+        })
+
+    def _handle_resource_query(self, sender_pid: int, payload: dict):
+        res_key = payload.get("resource", "").upper()
+        qty = int(payload.get("quantity", 1))
+        avail = min(qty, self.resources.get(res_key, 0))
+        self.send_reliable(sender_pid, MSG_RESOURCE_OFFER, {
+            "age": self.current_age,
+            "turn": self.current_turn,
+            "resource": res_key,
+            "available": avail
+        })
+
+    def _handle_resource_offer(self, sender_pid: int, payload: dict):
+        res_key = payload.get("resource", "").upper()
+        avail = int(payload.get("available", 0))
+        self.pending_offers.setdefault(sender_pid, {})[res_key] = avail
+        self.offer_event.set()
+
+        if not self.revealed_this_turn and avail > 0:
+            k = len(self.seating_order)
+            left_pid = self.seating_order[(self.my_seat - 1) % k]
+            is_mfg = res_key in ("GLASS", "PAPYRUS", "TEXTILE")
+            unit_price = self.trade_discounts["mfg"] if is_mfg else (
+                self.trade_discounts["raw_left"] if sender_pid == left_pid else self.trade_discounts["raw_right"]
+            )
+            if self.coins >= unit_price:
+                self.coins -= unit_price
+                self.resources_bought_this_turn.append({
+                    "peer_id": sender_pid, "resource": res_key, "quantity": 1, "coins_paid": unit_price
+                })
+                self.send_reliable(sender_pid, MSG_RESOURCE_BUY, {
+                    "age": self.current_age,
+                    "turn": self.current_turn,
+                    "resource": res_key,
+                    "quantity": 1,
+                    "coins_paid": unit_price
+                })
+
+    def _handle_resource_buy(self, sender_pid: int, payload: dict):
+        paid = int(payload.get("coins_paid", 0))
+        self.coins += paid
+        if self.manifest_peer_id in self.public_tableaus:
+            self.public_tableaus[self.manifest_peer_id]["coins"] = self.coins
+        if sender_pid in self.public_tableaus:
+            self.public_tableaus[sender_pid]["coins"] = self.public_tableaus[sender_pid].get("coins", 3) - paid
 
     def draft_action(self, card_idx: int, action: str = "BUILD"):
         if self.spectator:
@@ -701,12 +765,66 @@ class Peer7WDNode:
         if not self.spectator and self.revealed_this_turn and not self.announced_this_turn:
             if len(self.card_reveals) == len(self.seating_order):
                 self.announced_this_turn = True
-                self._execute_resolve_and_announce()
+                threading.Thread(target=self._execute_resolve_and_announce, daemon=True).start()
+
+    def _acquire_missing_resources(self, res_req: Dict[str, int], coins_req: int) -> bool:
+        bought_counts = {r: 0 for r in RESOURCE_KEYS}
+        for b in self.resources_bought_this_turn:
+            bought_counts[b["resource"]] = bought_counts.get(b["resource"], 0) + b["quantity"]
+
+        deficit = {
+            r: max(0, amt - self.resources.get(r, 0) - bought_counts.get(r, 0))
+            for r, amt in res_req.items()
+        }
+        if sum(deficit.values()) == 0:
+            return self.coins >= coins_req
+
+        k = len(self.seating_order)
+        left_pid = self.seating_order[(self.my_seat - 1) % k]
+        right_pid = self.seating_order[(self.my_seat + 1) % k]
+        self.pending_offers.clear()
+
+        for r, need in deficit.items():
+            if need > 0:
+                self.offer_event.clear()
+                self.send_reliable(left_pid, MSG_RESOURCE_QUERY, {"age": self.current_age, "turn": self.current_turn, "resource": r, "quantity": need})
+                if right_pid != left_pid:
+                    self.send_reliable(right_pid, MSG_RESOURCE_QUERY, {"age": self.current_age, "turn": self.current_turn, "resource": r, "quantity": need})
+                self.offer_event.wait(timeout=1.0)
+
+                is_mfg = r in ("GLASS", "PAPYRUS", "TEXTILE")
+                neighbors = sorted(
+                    [(left_pid, self.trade_discounts["mfg"] if is_mfg else self.trade_discounts["raw_left"]),
+                     (right_pid, self.trade_discounts["mfg"] if is_mfg else self.trade_discounts["raw_right"])],
+                    key=lambda x: x[1]
+                )
+                rem = need
+                for npid, uprice in neighbors:
+                    avail = self.pending_offers.get(npid, {}).get(r, 0)
+                    take = min(rem, avail)
+                    if take > 0 and (self.coins - coins_req) >= take * uprice:
+                        paid = take * uprice
+                        self.coins -= paid
+                        rem -= take
+                        self.resources_bought_this_turn.append({"peer_id": npid, "resource": r, "quantity": take, "coins_paid": paid})
+                        self.send_reliable(npid, MSG_RESOURCE_BUY, {
+                            "age": self.current_age, "turn": self.current_turn,
+                            "resource": r, "quantity": take, "coins_paid": paid
+                        })
+                if rem > 0:
+                    return False
+        return self.coins >= coins_req
 
     def _execute_resolve_and_announce(self):
         card = self.chosen_card
         action = self.chosen_action
         self.current_hand = [c for c in self.current_hand if c["instance_id"] != card["instance_id"]]
+
+        if action == "BUILD":
+            coins_req, res_req = parse_card_cost(card["cost"])
+            is_chained = verify_chaining(card, self.built_cards)
+            if not is_chained and not self._acquire_missing_resources(res_req, coins_req):
+                action = "DISCARD"
 
         announce_payload = {
             "action": action,
@@ -718,7 +836,10 @@ class Peer7WDNode:
         if action == "BUILD":
             coins_req, _ = parse_card_cost(card["cost"])
             is_chained = verify_chaining(card, self.built_cards)
-            cost_paid = {"coins": 0 if is_chained else coins_req, "resources_bought": []}
+            cost_paid = {
+                "coins": 0 if is_chained else coins_req,
+                "resources_bought": list(self.resources_bought_this_turn)
+            }
 
             self.coins -= cost_paid["coins"]
             self.built_cards.append(card)
@@ -734,6 +855,7 @@ class Peer7WDNode:
         elif action == "DISCARD":
             self.coins += 3
 
+        self.resources_bought_this_turn.clear()
         self.action_announcements[self.manifest_peer_id] = announce_payload
         self.broadcast_mesh(MSG_ACTION_ANNOUNCE, announce_payload)
         self._check_action_announce_barrier()
@@ -1024,6 +1146,12 @@ class Peer7WDNode:
                     self._handle_action_announce(sender_pid, payload)
                 elif opcode == MSG_HAND_PASS:
                     self._handle_hand_pass(sender_pid, payload)
+                elif opcode == MSG_RESOURCE_QUERY and not self.spectator:
+                    self._handle_resource_query(sender_pid, payload)
+                elif opcode == MSG_RESOURCE_OFFER and not self.spectator:
+                    self._handle_resource_offer(sender_pid, payload)
+                elif opcode == MSG_RESOURCE_BUY and not self.spectator:
+                    self._handle_resource_buy(sender_pid, payload)
                 elif opcode == MSG_AGE_END:
                     self._handle_age_end(sender_pid, payload)
                 elif opcode == MSG_SCORE_REPORT:
@@ -1098,6 +1226,8 @@ def main():
             elif cmd == "pick" and not node.spectator and len(parts) > 1:
                 action = parts[2].upper() if len(parts) > 2 else "BUILD"
                 node.draft_action(int(parts[1]), action)
+            elif cmd == "trade" and not node.spectator and len(parts) > 2:
+                node.trade_resource(parts[1], parts[2])
             elif cmd == "dm" and len(parts) > 2:
                 node.send_reliable(int(parts[1]), MSG_DIRECT_MESSAGE, {"text": clip_text(parts[2])})
             elif cmd == "msg" and len(parts) > 1:
