@@ -94,6 +94,7 @@ class Peer7WDNode:
         self.game_port = game_port
         self.lobby_port = lobby_port
         self.verbose = verbose
+        self.logged_broadcasts: Set[Tuple] = set()
         self.spectator = spectator
         self.running = True
 
@@ -188,6 +189,10 @@ class Peer7WDNode:
     def log(self, direction: str, addr: Tuple[str, int], opcode: int, seq: int, ack: int, flags: int, payload: dict):
         if not self.verbose:
             return
+        key = (direction, opcode, json.dumps(payload, sort_keys=True))
+        if key in self.logged_broadcasts:
+            return
+        self.logged_broadcasts.add(key)
         name = OPCODE_NAMES.get(opcode, f"0x{opcode:02X}")
         ts = time.strftime("%H:%M:%S")
         flag_str = ""
@@ -256,6 +261,8 @@ class Peer7WDNode:
             self.log("SENT", addr, 0, 0, ack_number, FLAG_ACK, {})
 
     def broadcast_mesh(self, opcode: int, payload: dict, reliable: bool = True):
+        if self.spectator:
+            return
         for pid in list(self.manifest.keys()):
             if pid != self.manifest_peer_id and pid not in self.disconnected_peers:
                 if reliable and (opcode not in UNRELIABLE_MESSAGES):
@@ -1158,9 +1165,9 @@ class Peer7WDNode:
                     self._handle_score_report(sender_pid, payload)
                 elif opcode == MSG_GAME_END:
                     print("\n[+] Consensus reached: GAME_END broadcast confirmed.")
-                elif opcode == MSG_DIRECT_MESSAGE:
+                elif opcode == MSG_DIRECT_MESSAGE and not self.spectator:
                     print(f"\n[DM from Peer {sender_pid}]: {payload.get('text')}")
-                elif opcode == MSG_GROUP_MESSAGE:
+                elif opcode == MSG_GROUP_MESSAGE and not self.spectator:
                     print(f"\n[GROUP CHAT]: {payload.get('text')}")
                 elif opcode == MSG_ERROR:
                     print(f"\n[!] ERROR BROADCAST: {payload.get('code')} -> {payload.get('detail')}")
@@ -1202,10 +1209,10 @@ def main():
         print("  start                    - Start Seed Commit ceremony")
         print("  pick <idx> [action]      - Draft card (action: BUILD, DISCARD, WONDER)")
         print("  trade <left/right> <res> - Query neighbor for resource")
+        print("  dm <peer_id> <text>      - Send DIRECT_MESSAGE (0x18)")
+        print("  msg <text>               - Send GROUP_MESSAGE (0x19)")
     else:
         print("  board                    - Display live spectator overview")
-    print("  dm <peer_id> <text>      - Send DIRECT_MESSAGE (0x18)")
-    print("  msg <text>               - Send GROUP_MESSAGE (0x19)")
     print("  ping <peer_id>           - Ping peer to test RTT/RTO")
     print("  verbose                  - Toggle runtime verbose mode on/off")
     print("  roster                   - Show manifest and seating order")
@@ -1228,9 +1235,9 @@ def main():
                 node.draft_action(int(parts[1]), action)
             elif cmd == "trade" and not node.spectator and len(parts) > 2:
                 node.trade_resource(parts[1], parts[2])
-            elif cmd == "dm" and len(parts) > 2:
+            elif cmd == "dm" and not node.spectator and len(parts) > 2:
                 node.send_reliable(int(parts[1]), MSG_DIRECT_MESSAGE, {"text": clip_text(parts[2])})
-            elif cmd == "msg" and len(parts) > 1:
+            elif cmd == "msg" and not node.spectator and len(parts) > 1:
                 node.broadcast_mesh(MSG_GROUP_MESSAGE, {"text": clip_text(line.split(" ", 1)[1])})
             elif cmd == "ping" and len(parts) > 1:
                 target_pid = int(parts[1])
